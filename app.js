@@ -1,237 +1,202 @@
-const ANIKOTO_API = "https://anikotoapi.site";
-const MEGAPLAY_EP_BASE = "https://megaplay.buzz/stream/s-2";
-const MEGAPLAY_MAL_BASE = "https://megaplay.buzz/stream/mal";
+// List of API mirrors to try in sequence
+const API_ENDPOINTS = [
+    "https://anikototvapi.vercel.app/api",               // Primary AniKoto API Vercel Mirror
+    "https://api.jikan.moe/v4",                          // Jikan (MAL Backup for metadata)
+    "https://corsproxy.io/?https://anikotoapi.site"      // CORS-proxied Anikoto Mirror
+];
 
-let activeState = {
-    currentSeries: null,
-    currentEpisode: null,
-    audioMode: 'sub', // 'sub' or 'dub'
-    activeServer: 'megaplay-catalog'
-};
+const MEGAPLAY_BASE = "https://megaplay.buzz/stream/s-2";
+let currentEmbedId = "";
 
-// Initial Load
-document.addEventListener("DOMContentLoaded", () => {
-    loadHome();
-});
+/**
+ * Helper function to safely fetch JSON from fallback sources
+ */
+async function fetchWithFallback(path) {
+    // 1. Try AniKoto Vercel API
+    try {
+        const response = await fetch(`${API_ENDPOINTS[0]}${path}`);
+        if (response.ok) return await response.json();
+    } catch (e) {
+        console.warn("Primary API mirror failed, trying secondary CORS proxy...", e);
+    }
 
+    // 2. Try CORS Proxy on secondary mirror
+    try {
+        const response = await fetch(`${API_ENDPOINTS[2]}${path}`);
+        if (response.ok) return await response.json();
+    } catch (e) {
+        console.warn("Secondary API proxy failed...", e);
+    }
+
+    throw new Error("All API endpoints unreachable");
+}
+
+/**
+ * Load Recent / Trending Catalog
+ */
 async function loadHome() {
     const container = document.getElementById("mainContainer");
-    container.innerHTML = `<div class="flex justify-center items-center py-32"><div class="animate-spin rounded-full h-12 w-12 border-4 border-brand-500 border-t-transparent"></div></div>`;
-
+    container.innerHTML = `
+        <h2 class="text-2xl font-bold mb-4">Recent & Trending Anime</h2>
+        <div id="grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4"></div>
+    `;
+    
     try {
-        const res = await fetch(`${ANIKOTO_API}/recent-anime`);
-        const data = await res.json();
+        // Fetch trending/recent anime
+        const data = await fetchWithFallback("");
+        const grid = document.getElementById("grid");
+        
+        // Normalize response payload across mirrors
+        const animeList = data.trending || data.spotlight || data.data || [];
 
+        if (animeList.length === 0) {
+            grid.innerHTML = `<p class="col-span-full text-slate-400">No catalog data available right now.</p>`;
+            return;
+        }
+
+        grid.innerHTML = animeList.map(anime => {
+            const title = anime.name || anime.title || "Unknown Title";
+            const poster = anime.poster || anime.image || anime.images?.jpg?.image_url || "";
+            const id = anime.id || anime.mal_id;
+
+            return `
+                <div onclick="loadAnimeDetails('${id}')" class="bg-slate-900 rounded-lg overflow-hidden cursor-pointer hover:scale-105 transition border border-slate-800 hover:border-red-500">
+                    <img src="${poster}" alt="${title}" class="w-full h-64 object-cover" onerror="this.src='https://via.placeholder.com/300x400?text=No+Cover'">
+                    <div class="p-3">
+                        <h3 class="font-semibold text-sm truncate">${title}</h3>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+    } catch (e) {
         container.innerHTML = `
-            <div class="space-y-8">
-                <section>
-                    <div class="flex items-center justify-between mb-4">
-                        <h2 class="text-xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
-                            <span class="w-2 h-5 bg-brand-500 rounded-full"></span> Recent Releases
-                        </h2>
-                    </div>
-                    <div id="animeGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
-                        ${renderAnimeCards(data)}
-                    </div>
-                </section>
+            <div class="bg-slate-900 border border-red-500/30 p-6 rounded-lg text-center my-10 max-w-md mx-auto">
+                <h3 class="text-red-500 font-bold text-lg mb-2">Unable to Load Catalog</h3>
+                <p class="text-sm text-slate-400 mb-4">Public API mirrors are rate limited or blocked by your browser's CORS policy.</p>
+                <button onclick="loadHome()" class="bg-red-600 px-4 py-2 rounded text-sm font-semibold hover:bg-red-500">Retry Request</button>
             </div>
         `;
-    } catch (err) {
-        showError("Failed to fetch recent catalog from API mirror.");
     }
 }
 
-async function loadRecent() {
-    loadHome();
-}
+/**
+ * Load Specific Anime Details and Episodes
+ */
+async function loadAnimeDetails(id) {
+    const container = document.getElementById("mainContainer");
+    container.innerHTML = `<p class="text-center py-20 text-slate-400">Loading series details and episodes...</p>`;
 
-function renderAnimeCards(list) {
-    if (!list || list.length === 0) {
-        return `<p class="col-span-full text-slate-400">No anime found.</p>`;
+    try {
+        const data = await fetchWithFallback(`/anime/${id}`);
+        const anime = data.data || data;
+        
+        const episodesRes = await fetchWithFallback(`/episodes/${id}`);
+        const episodes = episodesRes.episodes || episodesRes.data || [];
+        
+        const firstEp = episodes[0];
+        currentEmbedId = firstEp ? (firstEp.episode_embed_id || firstEp.episodeId || firstEp.id) : id;
+
+        container.innerHTML = `
+            <button onclick="loadHome()" class="mb-4 text-sm bg-slate-800 px-3 py-1 rounded hover:bg-slate-700">&larr; Back to Catalog</button>
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="lg:col-span-2">
+                    <div class="aspect-video bg-black rounded-lg overflow-hidden shadow-lg border border-slate-800">
+                        <iframe id="playerFrame" src="${MEGAPLAY_BASE}/${currentEmbedId}/sub" class="w-full h-full border-0" allowfullscreen></iframe>
+                    </div>
+                    <div class="flex justify-between items-center mt-4">
+                        <h2 class="text-xl font-bold" id="currentEpTitle">${firstEp ? `Episode ${firstEp.number \vert{}\vert{} 1}:${firstEp.title || ''}` : (anime.name || 'Anime Stream')}</h2>
+                        <select id="serverSelect" onchange="changeServer()" class="bg-slate-800 text-xs px-3 py-1.5 rounded border border-slate-700">
+                            <option value="megaplay-sub">MegaPlay (SUB)</option>
+                            <option value="megaplay-dub">MegaPlay (DUB)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="bg-slate-900 p-4 rounded-lg h-[500px] flex flex-col border border-slate-800">
+                    <h3 class="font-semibold mb-3 border-b border-slate-800 pb-2">Episodes (${episodes.length})</h3>
+                    <div class="overflow-y-auto flex-1 space-y-1 pr-2">
+                        ${episodes.map(ep => {
+                            const epId = ep.episode_embed_id || ep.episodeId || ep.id;
+                            const epNum = ep.number || ep.episode || 1;
+                            const epTitle = ep.title ? `Ep ${epNum}:${ep.title}` : `Episode ${epNum}`;
+                            return `
+                                <button onclick="playEpisode('${epId}', '${epTitle.replace(/'/g, "\\'")}')" class="w-full text-left px-3 py-2 rounded bg-slate-800 hover:bg-slate-700 text-sm truncate">
+                                    ${epTitle}
+                                </button>
+                            `;
+                        }).join('') || '<p class="text-slate-500 text-sm">No episodes found.</p>'}
+                    </div>
+                </div>
+            </div>
+        `;
+    } catch (e) {
+        container.innerHTML = `<p class="text-red-500 text-center py-20">Could not fetch series episodes.</p>`;
     }
-
-    return list.map(item => `
-        <div onclick="loadAnimeDetails('${item.id}')" class="group relative bg-slate-900 border border-slate-800/80 rounded-xl overflow-hidden cursor-pointer hover:border-brand-500/50 transition duration-200 flex flex-col">
-            <div class="aspect-[3/4] w-full overflow-hidden relative bg-slate-800">
-                <img src="${item.poster}" alt="${escapeHtml(item.title)}" class="w-full h-full object-cover group-hover:scale-105 transition duration-300" loading="lazy">
-                ${item.episodes ? `<span class="absolute top-2 right-2 bg-slate-950/80 backdrop-blur px-2 py-0.5 rounded text-[10px] font-bold text-slate-300">EP ${item.episodes.sub || item.episodes.dub || '?'}</span>` : ''}
-            </div>
-            <div class="p-3 flex-1 flex flex-col justify-between">
-                <h3 class="font-semibold text-xs text-slate-200 line-clamp-2 group-hover:text-brand-500 transition">${escapeHtml(item.title)}</h3>
-            </div>
-        </div>
-    `).join('');
 }
 
+/**
+ * Handle Episode Change
+ */
+function playEpisode(embedId, title) {
+    currentEmbedId = embedId;
+    document.getElementById("currentEpTitle").innerText = title;
+    updatePlayerFrame();
+}
+
+/**
+ * Handle Server/Audio Mode Switching
+ */
+function changeServer() {
+    updatePlayerFrame();
+}
+
+function updatePlayerFrame() {
+    if (!currentEmbedId) return;
+    const mode = document.getElementById("serverSelect")?.value || "megaplay-sub";
+    const iframe = document.getElementById("playerFrame");
+
+    if (mode === "megaplay-dub") {
+        iframe.src = `https://megaplay.buzz/stream/s-2/${currentEmbedId}/dub`;
+    } else {
+        iframe.src = `${MEGAPLAY_BASE}/${currentEmbedId}/sub`;
+    }
+}
+
+/**
+ * Handle Search Queries
+ */
 async function handleSearch() {
     const query = document.getElementById("searchInput").value.trim();
     if (!query) return;
-
+    
     const container = document.getElementById("mainContainer");
-    container.innerHTML = `<div class="flex justify-center items-center py-32"><div class="animate-spin rounded-full h-12 w-12 border-4 border-brand-500 border-t-transparent"></div></div>`;
-
+    container.innerHTML = `
+        <h2 class="text-2xl font-bold mb-4">Search Results for "${query}"</h2>
+        <div id="grid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4"></div>
+    `;
+    
     try {
-        const res = await fetch(`${ANIKOTO_API}/search?q=${encodeURIComponent(query)}`);
-        const data = await res.json();
+        const data = await fetchWithFallback(`/search?q=${encodeURIComponent(query)}`);
+        const results = data.animes || data.data || [];
+        const grid = document.getElementById("grid");
 
-        container.innerHTML = `
-            <section class="space-y-4">
-                <h2 class="text-xl font-bold tracking-tight text-slate-100">Search Results for "${escapeHtml(query)}"</h2>
-                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
-                    ${renderAnimeCards(data.results || data)}
-                </div>
-            </section>
-        `;
-    } catch (e) {
-        showError("Unable to execute search request.");
-    }
-}
-
-async function loadAnimeDetails(seriesId) {
-    const container = document.getElementById("mainContainer");
-    container.innerHTML = `<div class="flex justify-center items-center py-32"><div class="animate-spin rounded-full h-12 w-12 border-4 border-brand-500 border-t-transparent"></div></div>`;
-
-    try {
-        const res = await fetch(`${ANIKOTO_API}/series/${seriesId}`);
-        const anime = await res.json();
-        
-        activeState.currentSeries = anime;
-        const episodes = anime.episodes || [];
-        const firstEp = episodes[0] || null;
-
-        container.innerHTML = `
-            <div class="space-y-6">
-                <!-- Top Navigation/Back Button -->
-                <button onclick="loadHome()" class="inline-flex items-center gap-2 text-xs font-semibold text-slate-400 hover:text-white bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800 transition">
-                    &larr; Back to Catalog
-                </button>
-
-                <!-- Streaming Player Layout -->
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    
-                    <!-- Main Video Player Section -->
-                    <div class="lg:col-span-2 space-y-4">
-                        <div class="aspect-video bg-black rounded-xl overflow-hidden shadow-2xl relative border border-slate-800">
-                            <iframe id="playerFrame" class="w-full h-full border-0" allowfullscreen></iframe>
-                        </div>
-
-                        <!-- Player Controls Bar -->
-                        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
-                            <div>
-                                <h1 id="currentEpTitle" class="font-bold text-slate-100 text-base lg:text-lg">Loading...</h1>
-                                <p class="text-xs text-slate-400 mt-0.5">${escapeHtml(anime.title)}</p>
-                            </div>
-
-                            <div class="flex items-center gap-3">
-                                <!-- Audio Track Selector -->
-                                <div class="bg-slate-800 p-1 rounded-lg flex text-xs font-semibold">
-                                    <button id="btnSub" onclick="setAudioMode('sub')" class="px-3 py-1 rounded-md text-slate-300 transition">SUB</button>
-                                    <button id="btnDub" onclick="setAudioMode('dub')" class="px-3 py-1 rounded-md text-slate-300 transition">DUB</button>
-                                </div>
-
-                                <!-- Server Switcher Dropdown -->
-                                <select id="serverSelect" onchange="switchServer()" class="bg-slate-800 text-xs text-slate-200 border border-slate-700 px-3 py-1.5 rounded-lg focus:outline-none">
-                                    <option value="megaplay-catalog">MegaPlay (Catalog ID)</option>
-                                    <option value="megaplay-mal">MegaPlay (MAL ID)</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Episode Playlist Sidebar -->
-                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col h-[520px]">
-                        <div class="flex items-center justify-between mb-3">
-                            <h3 class="font-bold text-sm text-slate-200">Episodes</h3>
-                            <span class="text-xs text-slate-400">${episodes.length} Available</span>
-                        </div>
-                        <div class="overflow-y-auto flex-1 space-y-1.5 custom-scrollbar pr-1" id="episodeListContainer">
-                            ${episodes.map(ep => `
-                                <button onclick="selectEpisode('${ep.episode_embed_id}', '${ep.number}', '${escapeHtml(ep.title)}') shadow-sm" 
-                                    id="ep-btn-${ep.episode_embed_id}" 
-                                    class="ep-item w-full text-left px-3 py-2.5 rounded-lg bg-slate-800/60 hover:bg-slate-800 text-slate-300 hover:text-white transition flex items-center justify-between text-xs font-medium">
-                                    <span class="truncate pr-2">Ep ${ep.number}: ${escapeHtml(ep.title)}</span>
-                                </button>
-                            `).join('')}
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        if (firstEp) {
-            selectEpisode(firstEp.episode_embed_id, firstEp.number, firstEp.title);
+        if (results.length === 0) {
+            grid.innerHTML = `<p class="col-span-full text-slate-400">No anime matching "${query}" were found.</p>`;
+            return;
         }
 
+        grid.innerHTML = results.map(anime => `
+            <div onclick="loadAnimeDetails('${anime.id || anime.mal_id}')" class="bg-slate-900 rounded-lg overflow-hidden cursor-pointer hover:scale-105 transition border border-slate-800">
+                <img src="${anime.poster || anime.image || ''}" alt="${anime.name || anime.title}" class="w-full h-64 object-cover" onerror="this.src='https://via.placeholder.com/300x400?text=No+Cover'">
+                <div class="p-3">
+                    <h3 class="font-semibold text-sm truncate">${anime.name || anime.title}</h3>
+                </div>
+            </div>
+        `).join('');
     } catch (e) {
-        showError("Unable to load anime episode data.");
+        container.innerHTML = `<p class="text-red-500">Search query failed. Check connection or try another term.</p>`;
     }
 }
 
-function selectEpisode(embedId, epNum, epTitle) {
-    activeState.currentEpisode = { embedId, epNum, epTitle };
-    document.getElementById("currentEpTitle").innerText = `Episode ${epNum}: ${epTitle}`;
-
-    // Update active highlight class
-    document.querySelectorAll(".ep-item").forEach(el => el.classList.remove("bg-brand-500", "text-white", "font-bold"));
-    const activeBtn = document.getElementById(`ep-btn-${embedId}`);
-    if (activeBtn) {
-        activeBtn.classList.add("bg-brand-500", "text-white", "font-bold");
-    }
-
-    updateEmbedUrl();
-}
-
-function setAudioMode(mode) {
-    activeState.audioMode = mode;
-    
-    const subBtn = document.getElementById("btnSub");
-    const dubBtn = document.getElementById("btnDub");
-
-    if (mode === 'sub') {
-        subBtn.className = "px-3 py-1 rounded-md bg-brand-500 text-white font-bold transition";
-        dubBtn.className = "px-3 py-1 rounded-md text-slate-400 hover:text-slate-200 transition";
-    } else {
-        dubBtn.className = "px-3 py-1 rounded-md bg-brand-500 text-white font-bold transition";
-        subBtn.className = "px-3 py-1 rounded-md text-slate-400 hover:text-slate-200 transition";
-    }
-
-    updateEmbedUrl();
-}
-
-function switchServer() {
-    activeState.activeServer = document.getElementById("serverSelect").value;
-    updateEmbedUrl();
-}
-
-function updateEmbedUrl() {
-    const iframe = document.getElementById("playerFrame");
-    const { currentSeries, currentEpisode, audioMode, activeServer } = activeState;
-
-    if (!currentEpisode) return;
-
-    let targetUrl = "";
-
-    if (activeServer === "megaplay-catalog") {
-        targetUrl = `${MEGAPLAY_EP_BASE}/${currentEpisode.embedId}/${audioMode}`;
-    } else if (activeServer === "megaplay-mal" && currentSeries.mal_id) {
-        targetUrl = `${MEGAPLAY_MAL_BASE}/${currentSeries.mal_id}/${currentEpisode.epNum}/${audioMode}`;
-    } else {
-        targetUrl = `${MEGAPLAY_EP_BASE}/${currentEpisode.embedId}/${audioMode}`;
-    }
-
-    iframe.src = targetUrl;
-}
-
-function showError(msg) {
-    document.getElementById("mainContainer").innerHTML = `
-        <div class="bg-red-500/10 border border-red-500/20 text-red-400 p-6 rounded-xl text-center max-w-lg mx-auto my-20 space-y-3">
-            <p class="font-semibold text-sm">${msg}</p>
-            <button onclick="loadHome()" class="text-xs bg-red-500 text-white font-bold px-4 py-2 rounded-lg hover:bg-red-600 transition">Return to Catalog</button>
-        </div>
-    `;
-}
-
-function escapeHtml(str) {
-    if (!str) return '';
-    return str.replace(/'/g, "&#39;").replace(/"/g, "&quot;");
-}
+// Initializer
+loadHome();
